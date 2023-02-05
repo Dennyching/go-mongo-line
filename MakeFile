@@ -1,0 +1,1 @@
+local-debug: docker-compose up -d
