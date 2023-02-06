@@ -1,1 +1,5 @@
-local-debug: docker-compose up -d
+local-debug:	local-db	local-run
+local-db:
+	docker compose -f ./deployment/docker-compose.yaml up -d
+local-run:
+	go run main.go mono
