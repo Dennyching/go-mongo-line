@@ -3,3 +3,5 @@ local-db:
 	docker compose -f ./deployment/docker-compose.yaml up -d
 local-run:
 	go run main.go mono
+local-down:
+	docker compose -f ./deployment/docker-compose.yaml down --volumes

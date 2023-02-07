@@ -49,13 +49,15 @@ var (
 	messageCollection *mongo.Collection
 
 	bot *linebot.Client
+
+	botId string
 )
 
 type CreateMessageRequest struct {
-	ID        string    `json:"ID" bson:"ID" binding:"required"`
+	ID        string    `json:"ID" bson:"ID"`
 	Text      string    `json:"Text" bson:"Text" binding:"required"`
-	Sender    string    `json:"Sender" bson:"Sender"`
-	Receiver  string    `json:"Receiver" bson:"Receiver" binding:"required"`
+	Sender    string    `json:"Sender" bson:"Sender" binding:"required"`
+	Receiver  string    `json:"Receiver" bson:"Receiver" `
 	CreatedAt time.Time `json:"Created_at" bson:"Created_at"`
 }
 
@@ -79,6 +81,8 @@ func init() {
 	if err != nil {
 		log.Fatal("Could not load environment variables", err)
 	}
+
+	botId = config.LineBotUserId
 
 	// ? Create a context
 	ctx = context.TODO()
@@ -149,51 +153,58 @@ func execute_service(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	http.HandleFunc("/callback", func(w http.ResponseWriter, req *http.Request) {
-		events, err := bot.ParseRequest(req)
-		if err != nil {
-			if err == linebot.ErrInvalidSignature {
-				w.WriteHeader(400)
-			} else {
-				w.WriteHeader(500)
-			}
-			return
-		}
-		for _, event := range events {
-			if event.Type == linebot.EventTypeMessage {
-				senderID := event.Source.UserID
-				fmt.Println("Sender ID:", senderID)
-				switch message := event.Message.(type) {
-				case *linebot.TextMessage:
-					NewMessage := &CreateMessageRequest{
-						ID:        message.ID,
-						Text:      message.Text,
-						Sender:    senderID,
-						Receiver:  config.LineBotUserId,
-						CreatedAt: time.Now(),
-					}
-					log.Printf("User sent a text message: %s", message.Text)
-					log.Printf("Id: %s", message.ID)
-					CreateMessageFunc(NewMessage, messageCollection)
-					_, err := FindUserById(senderID)
-					if err != nil {
-						InsertUser(senderID)
-					}
-				}
-			}
-		}
-	})
-
 	router := server.Group("/api")
+
 	router.GET("/healthchecker", func(ctx *gin.Context) {
 		ctx.JSON(http.StatusOK, gin.H{"status": "success", "message": value})
 	})
 
+	// Receive message from line
+	router.POST("/webhook", ReceiveMessage)
+
+	// semd message to user by linebot
 	router.POST("/sendmessage", SendMessage)
+
+	// get user's message by userId
+	router.GET("/message/:userId", GetMessageRequest)
+
+	// get user's message by userId
+	router.GET("/userlist/", GetAllUer)
 
 	log.Fatal(server.Run(":" + config.Port))
 	return nil
 
+}
+
+func ReceiveMessage(ctx *gin.Context) {
+	// Read the incoming message from LINE
+	events, err := bot.ParseRequest(ctx.Request)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
+	}
+	for _, event := range events {
+		if event.Type == linebot.EventTypeMessage {
+			senderID := event.Source.UserID
+			fmt.Println("Sender ID:", senderID)
+			switch message := event.Message.(type) {
+			case *linebot.TextMessage:
+				NewMessage := &CreateMessageRequest{
+					ID:        message.ID,
+					Text:      message.Text,
+					Sender:    senderID,
+					Receiver:  botId,
+					CreatedAt: time.Now(),
+				}
+				CreateMessageFunc(NewMessage, messageCollection)
+				_, err := FindUserById(senderID)
+				if err != nil {
+					InsertUser(senderID)
+				}
+			}
+		}
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{"message": "received"})
 }
 
 func SendMessage(ctx *gin.Context) {
@@ -203,40 +214,43 @@ func SendMessage(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
 		return
 	}
-	CreateMessageFunc(&message, messageCollection)
-
-	_, err := FindUserById(message.Receiver)
+	line_message := linebot.NewTextMessage(message.Text)
+	response, err := bot.PushMessage(message.Sender, line_message).Do()
 	if err != nil {
-		InsertUser(message.Receiver)
+		log.Print(err)
+		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
 	}
 
-	line_message := linebot.NewTextMessage(message.Text)
-	if _, err := bot.PushMessage(message.Receiver, line_message).Do(); err != nil {
-		log.Print(err)
+	message.ID = response.RequestID
+	message.Receiver = botId
+
+	message.CreatedAt = time.Now()
+
+	CreateMessageFunc(&message, messageCollection)
+
+	if _, err := FindUserById(message.Receiver); err != nil {
+		InsertUser(message.Receiver)
 	}
 
 }
 
-func CreateMessageFunc(post *CreateMessageRequest, postCollection *mongo.Collection) (DBMessage, error) {
+func CreateMessageFunc(message *CreateMessageRequest, messageCollection *mongo.Collection) (DBMessage, error) {
 
-	res, err := postCollection.InsertOne(ctx, post)
+	res, err := messageCollection.InsertOne(ctx, message)
 
-	emptyPost := DBMessage{}
+	emptyMessage := DBMessage{}
 
 	if err != nil {
-		if er, ok := err.(mongo.WriteException); ok && er.WriteErrors[0].Code == 11000 {
-			return emptyPost, errors.New("post with that title already exists")
-		}
-		return emptyPost, err
+		return emptyMessage, err
 	}
 
-	var newPost DBMessage
+	var newMessage DBMessage
 	query := bson.M{"_id": res.InsertedID}
-	if err = postCollection.FindOne(ctx, query).Decode(&newPost); err != nil {
-		return emptyPost, err
+	if err = messageCollection.FindOne(ctx, query).Decode(&newMessage); err != nil {
+		return emptyMessage, err
 	}
 
-	return newPost, nil
+	return newMessage, nil
 }
 
 func FindUserById(userId string) (*User, error) {
@@ -279,20 +293,18 @@ func InsertUser(userId string) (*User, error) {
 	return newUser, nil
 }
 
-func FindAllUser(page int, limit int) ([]*User, error) {
-	if page == 0 {
-		page = 1
+func GetAllUer(ctx *gin.Context) {
+	res, err := FindAllUser()
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
 	}
+	ctx.JSON(http.StatusOK, gin.H{"status": "success", "data": res})
 
-	if limit == 0 {
-		limit = 10
-	}
+}
 
-	skip := (page - 1) * limit
+func FindAllUser() ([]*User, error) {
 
 	opt := options.FindOptions{}
-	opt.SetLimit(int64(limit))
-	opt.SetSkip(int64(skip))
 	opt.SetSort(bson.M{"ID": -1})
 
 	query := bson.M{}
@@ -306,14 +318,14 @@ func FindAllUser(page int, limit int) ([]*User, error) {
 	var users []*User
 
 	for cursor.Next(ctx) {
-		post := &User{}
-		err := cursor.Decode(post)
+		user := &User{}
+		err := cursor.Decode(user)
 
 		if err != nil {
 			return nil, err
 		}
 
-		users = append(users, post)
+		users = append(users, user)
 	}
 
 	if err := cursor.Err(); err != nil {
@@ -327,25 +339,24 @@ func FindAllUser(page int, limit int) ([]*User, error) {
 	return users, nil
 }
 
-func FindMessageByUserId(page int, limit int, userId string) ([]*User, error) {
-	if page == 0 {
-		page = 1
+func GetMessageRequest(ctx *gin.Context) {
+	userId := ctx.Param("userId")
+	res, err := FindMessageByUserId(userId)
+	if err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
 	}
+	ctx.JSON(http.StatusOK, gin.H{"status": "success", "data": res})
 
-	if limit == 0 {
-		limit = 10
-	}
+}
 
-	skip := (page - 1) * limit
+func FindMessageByUserId(userId string) ([]*DBMessage, error) {
 
 	opt := options.FindOptions{}
-	opt.SetLimit(int64(limit))
-	opt.SetSkip(int64(skip))
 	opt.SetSort(bson.M{"ID": -1})
 
 	query := bson.M{"$or": []bson.M{
-		{"Sender": strings.ToLower(userId)},
-		{"Receiver": strings.ToLower(userId)},
+		{"Sender": userId},
+		{"Receiver": userId},
 	}}
 	cursor, err := messageCollection.Find(ctx, query, &opt)
 	if err != nil {
@@ -354,26 +365,26 @@ func FindMessageByUserId(page int, limit int, userId string) ([]*User, error) {
 
 	defer cursor.Close(ctx)
 
-	var users []*User
+	var messages []*DBMessage
 
 	for cursor.Next(ctx) {
-		post := &User{}
-		err := cursor.Decode(post)
+		message := &DBMessage{}
+		err := cursor.Decode(message)
 
 		if err != nil {
 			return nil, err
 		}
 
-		users = append(users, post)
+		messages = append(messages, message)
 	}
 
 	if err := cursor.Err(); err != nil {
 		return nil, err
 	}
 
-	if len(users) == 0 {
-		return []*User{}, nil
+	if len(messages) == 0 {
+		return []*DBMessage{}, nil
 	}
 
-	return users, nil
+	return messages, nil
 }
