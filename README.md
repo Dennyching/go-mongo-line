@@ -1,10 +1,11 @@
 # go-mongo-line
 
 
-- Decription: use golang to implement golang line bot three function 
+- Decription: use golang to implement golang line bot four function 
 1. receive message (webhook) 
 2. send message 
 3. show user list
+4. get message by user_id
 
 - test step: 
 1. clone project
