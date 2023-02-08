@@ -6,19 +6,17 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/go-redis/redis/v8"
 	"github.com/line/line-bot-sdk-go/v7/linebot"
 	"github.com/practice/golang-line/config"
+	"github.com/practice/golang-line/models"
+	"github.com/practice/golang-line/services"
 	"github.com/spf13/cobra"
-	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
@@ -42,7 +40,6 @@ var (
 	server      *gin.Engine
 	ctx         context.Context
 	mongoclient *mongo.Client
-	redisclient *redis.Client
 
 	userCollection *mongo.Collection
 
@@ -52,26 +49,6 @@ var (
 
 	botId string
 )
-
-type CreateMessageRequest struct {
-	ID        string    `json:"ID" bson:"ID"`
-	Text      string    `json:"Text" bson:"Text" binding:"required"`
-	Sender    string    `json:"Sender" bson:"Sender" binding:"required"`
-	Receiver  string    `json:"Receiver" bson:"Receiver" `
-	CreatedAt time.Time `json:"Created_at" bson:"Created_at"`
-}
-
-type DBMessage struct {
-	ID        string    `json:"ID" bson:"ID" binding:"required"`
-	Text      string    `json:"Text" bson:"Text" binding:"required"`
-	Sender    string    `json:"Sender" bson:"Sender"`
-	Receiver  string    `json:"Receiver" bson:"Receiver" binding:"required"`
-	CreatedAt time.Time `json:"Created_at" bson:"Created_at"`
-}
-
-type User struct {
-	ID string `json:"ID" bson:"ID" binding:"required"`
-}
 
 // ? Init function that will run before the "main" function
 func init() {
@@ -101,22 +78,6 @@ func init() {
 
 	fmt.Println("MongoDB successfully connected...")
 
-	// ? Connect to Redis
-	redisclient = redis.NewClient(&redis.Options{
-		Addr: config.RedisUri,
-	})
-
-	if _, err := redisclient.Ping(ctx).Result(); err != nil {
-		panic(err)
-	}
-
-	err = redisclient.Set(ctx, "test", "Welcome to Golang with Redis and MongoDB", 0).Err()
-	if err != nil {
-		panic(err)
-	}
-
-	fmt.Println("Redis client connected successfully...")
-
 	// Collections
 	userCollection = mongoclient.Database("golang_mongodb").Collection("users")
 
@@ -145,18 +106,10 @@ func execute_service(cmd *cobra.Command, args []string) error {
 
 	defer mongoclient.Disconnect(ctx)
 
-	value, err := redisclient.Get(ctx, "test").Result()
-
-	if err == redis.Nil {
-		fmt.Println("key: test does not exist")
-	} else if err != nil {
-		return err
-	}
-
 	router := server.Group("/api")
 
 	router.GET("/healthchecker", func(ctx *gin.Context) {
-		ctx.JSON(http.StatusOK, gin.H{"status": "success", "message": value})
+		ctx.JSON(http.StatusOK, gin.H{"status": "success"})
 	})
 
 	// Receive message from line
@@ -188,17 +141,17 @@ func ReceiveMessage(ctx *gin.Context) {
 			fmt.Println("Sender ID:", senderID)
 			switch message := event.Message.(type) {
 			case *linebot.TextMessage:
-				NewMessage := &CreateMessageRequest{
+				NewMessage := &models.CreateMessageRequest{
 					ID:        message.ID,
 					Text:      message.Text,
 					Sender:    senderID,
 					Receiver:  botId,
 					CreatedAt: time.Now(),
 				}
-				CreateMessageFunc(NewMessage, messageCollection)
-				_, err := FindUserById(senderID)
+				services.CreateMessageFunc(NewMessage, messageCollection, ctx)
+				_, err := services.FindUserById(senderID, userCollection, ctx)
 				if err != nil {
-					InsertUser(senderID)
+					services.InsertUser(senderID, userCollection, ctx)
 				}
 			}
 		}
@@ -208,7 +161,7 @@ func ReceiveMessage(ctx *gin.Context) {
 }
 
 func SendMessage(ctx *gin.Context) {
-	var message CreateMessageRequest
+	var message models.CreateMessageRequest
 
 	if err := ctx.ShouldBindJSON(&message); err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
@@ -226,165 +179,29 @@ func SendMessage(ctx *gin.Context) {
 
 	message.CreatedAt = time.Now()
 
-	CreateMessageFunc(&message, messageCollection)
+	services.CreateMessageFunc(&message, messageCollection, ctx)
 
-	if _, err := FindUserById(message.Receiver); err != nil {
-		InsertUser(message.Receiver)
+	if _, err := services.FindUserById(message.Receiver, userCollection, ctx); err != nil {
+		services.InsertUser(message.Receiver, userCollection, ctx)
 	}
 
-}
-
-func CreateMessageFunc(message *CreateMessageRequest, messageCollection *mongo.Collection) (DBMessage, error) {
-
-	res, err := messageCollection.InsertOne(ctx, message)
-
-	emptyMessage := DBMessage{}
-
-	if err != nil {
-		return emptyMessage, err
-	}
-
-	var newMessage DBMessage
-	query := bson.M{"_id": res.InsertedID}
-	if err = messageCollection.FindOne(ctx, query).Decode(&newMessage); err != nil {
-		return emptyMessage, err
-	}
-
-	return newMessage, nil
-}
-
-func FindUserById(userId string) (*User, error) {
-	var user *User
-
-	query := bson.M{"ID": strings.ToLower(userId)}
-	err := userCollection.FindOne(ctx, query).Decode(&user)
-
-	if err != nil {
-		return &User{}, err
-	}
-
-	return user, nil
-}
-
-func InsertUser(userId string) (*User, error) {
-	user := &User{
-		ID: userId,
-	}
-	res, err := userCollection.InsertOne(ctx, &user)
-	if err != nil {
-		return nil, err
-	}
-	// Create a unique index for the ID field
-	opt := options.Index()
-	opt.SetUnique(true)
-	index := mongo.IndexModel{Keys: bson.M{"ID": 1}, Options: opt}
-
-	if _, err := userCollection.Indexes().CreateOne(ctx, index); err != nil {
-		return nil, errors.New("could not create index for email")
-	}
-	var newUser *User
-	query := bson.M{"_id": res.InsertedID}
-
-	err = userCollection.FindOne(ctx, query).Decode(&newUser)
-	if err != nil {
-		return nil, err
-	}
-
-	return newUser, nil
 }
 
 func GetAllUer(ctx *gin.Context) {
-	res, err := FindAllUser()
+	res, err := services.FindAllUser(userCollection, ctx)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
 	}
 	ctx.JSON(http.StatusOK, gin.H{"status": "success", "data": res})
 
-}
-
-func FindAllUser() ([]*User, error) {
-
-	opt := options.FindOptions{}
-	opt.SetSort(bson.M{"ID": -1})
-
-	query := bson.M{}
-	cursor, err := userCollection.Find(ctx, query, &opt)
-	if err != nil {
-		return nil, err
-	}
-
-	defer cursor.Close(ctx)
-
-	var users []*User
-
-	for cursor.Next(ctx) {
-		user := &User{}
-		err := cursor.Decode(user)
-
-		if err != nil {
-			return nil, err
-		}
-
-		users = append(users, user)
-	}
-
-	if err := cursor.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(users) == 0 {
-		return []*User{}, nil
-	}
-
-	return users, nil
 }
 
 func GetMessageRequest(ctx *gin.Context) {
 	userId := ctx.Param("userId")
-	res, err := FindMessageByUserId(userId)
+	res, err := services.FindMessageByUserId(userId, messageCollection, ctx)
 	if err != nil {
 		ctx.JSON(http.StatusBadRequest, gin.H{"status": "fail", "message": err.Error()})
 	}
 	ctx.JSON(http.StatusOK, gin.H{"status": "success", "data": res})
 
-}
-
-func FindMessageByUserId(userId string) ([]*DBMessage, error) {
-
-	opt := options.FindOptions{}
-	opt.SetSort(bson.M{"ID": -1})
-
-	query := bson.M{"$or": []bson.M{
-		{"Sender": userId},
-		{"Receiver": userId},
-	}}
-	cursor, err := messageCollection.Find(ctx, query, &opt)
-	if err != nil {
-		return nil, err
-	}
-
-	defer cursor.Close(ctx)
-
-	var messages []*DBMessage
-
-	for cursor.Next(ctx) {
-		message := &DBMessage{}
-		err := cursor.Decode(message)
-
-		if err != nil {
-			return nil, err
-		}
-
-		messages = append(messages, message)
-	}
-
-	if err := cursor.Err(); err != nil {
-		return nil, err
-	}
-
-	if len(messages) == 0 {
-		return []*DBMessage{}, nil
-	}
-
-	return messages, nil
 }
