@@ -19,7 +19,8 @@
 - Postmen 
 https://documenter.getpostman.com/view/1088678/2s935pr3wR 
 
-- app.env
+- app.env \
+`
 PORT=8000
 MONGO_INITDB_ROOT_USERNAME=root
 MONGO_INITDB_ROOT_PASSWORD=password123
@@ -27,3 +28,4 @@ MONGODB_LOCAL_URI=mongodb://root:password123@localhost:6000
 LINE_BOT_CHANNEL_ACCESS_TOKEN=${your_LINE_BOT_CHANNEL_ACCESS_TOKEN}
 LINE_BOT_CHANNEL_SECRET=${your_LINE_BOT_CHANNEL_SECRET}
 LINE_BOT_USER_ID=${your_LINE_BOT_USER_ID}
+`
